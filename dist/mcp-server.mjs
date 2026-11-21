@@ -1576,70 +1576,377 @@ function countLines(text) {
   }
   return count;
 }
-async function commitPlannedWrites(plans) {
-  const written = [];
-  try {
-    for (const plan of plans) {
-      const target = plan.writeTargetPath;
-      const dir = path3.dirname(target);
-      await fs2.mkdir(dir, { recursive: true });
-      const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      try {
-        await fs2.writeFile(tmpPath, plan.newContent, "utf8");
-        if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs2.chmod(tmpPath, plan.originalMode);
-        }
-      } catch (tmpErr) {
-        try {
-          await fs2.unlink(tmpPath);
-        } catch {
-        }
-        throw tmpErr;
+function normalizeForCompare(p) {
+  const resolved = path3.resolve(p);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+function isStrictlyInsideDir(candidatePath, rootDir) {
+  const rel = path3.relative(
+    normalizeForCompare(rootDir),
+    normalizeForCompare(candidatePath)
+  );
+  return rel !== "" && !rel.startsWith("..") && !path3.isAbsolute(rel);
+}
+function isInsideGitDir(candidatePath, rootDir) {
+  const rel = toPosixPath(
+    path3.relative(normalizeForCompare(rootDir), normalizeForCompare(candidatePath))
+  );
+  return rel === ".git" || rel.startsWith(".git/");
+}
+function isCaseInsensitivePlatform() {
+  return process.platform === "win32" || process.platform === "darwin";
+}
+function normalizeEntryName(name) {
+  return isCaseInsensitivePlatform() ? name.toLowerCase() : name;
+}
+async function canonicalizePreserveLeaf(absPath) {
+  const normalized = path3.resolve(absPath);
+  const parentDir = path3.dirname(normalized);
+  const leaf = path3.basename(normalized);
+  if (parentDir === normalized) return normalized;
+  const tailSegments = [leaf];
+  let current = parentDir;
+  while (true) {
+    try {
+      const realAncestor = await fs2.realpath(current);
+      return path3.join(realAncestor, ...tailSegments.reverse());
+    } catch {
+      const next = path3.dirname(current);
+      if (next === current) {
+        return normalized;
       }
+      tailSegments.push(path3.basename(current));
+      current = next;
+    }
+  }
+}
+async function writeFileAtomically(params) {
+  const { target, content, mode, originalSymlinkTarget, onCommitted } = params;
+  const dir = path3.dirname(target);
+  await fs2.mkdir(dir, { recursive: true });
+  const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await fs2.writeFile(tmpPath, content, "utf8");
+    if (mode !== null && process.platform !== "win32") {
+      await fs2.chmod(tmpPath, mode);
+    }
+  } catch (tmpErr) {
+    try {
+      await fs2.unlink(tmpPath);
+    } catch {
+    }
+    throw tmpErr;
+  }
+  try {
+    await fs2.rename(tmpPath, target);
+    onCommitted();
+  } catch (renameErr) {
+    try {
+      await fs2.unlink(tmpPath);
+    } catch {
+    }
+    onCommitted();
+    if (originalSymlinkTarget) {
       try {
-        await fs2.rename(tmpPath, target);
-        written.push(plan);
-      } catch (renameErr) {
-        try {
-          await fs2.unlink(tmpPath);
-        } catch {
-        }
-        written.push(plan);
-        if (plan.originalSymlinkTarget) {
-          try {
-            await fs2.unlink(target);
-          } catch {
-          }
-        }
-        await fs2.writeFile(target, plan.newContent, "utf8");
-        if (plan.originalMode !== null && process.platform !== "win32") {
-          try {
-            await fs2.chmod(target, plan.originalMode);
-          } catch {
-          }
-        }
-        void renameErr;
+        await fs2.unlink(target);
+      } catch {
       }
     }
-  } catch (err) {
-    for (let i = written.length - 1; i >= 0; i--) {
-      const item = written[i];
-      const target = item.writeTargetPath;
+    await fs2.writeFile(target, content, "utf8");
+    if (mode !== null && process.platform !== "win32") {
       try {
-        if (item.originalSymlinkTarget) {
-          await fs2.unlink(target).catch(() => {
-          });
-          await fs2.symlink(item.originalSymlinkTarget, target);
-        } else if (item.existed && item.originalBuffer !== null) {
-          await fs2.writeFile(target, item.originalBuffer);
-          if (item.originalMode !== null && process.platform !== "win32") {
-            await fs2.chmod(target, item.originalMode);
+        await fs2.chmod(target, mode);
+      } catch {
+      }
+    }
+    void renameErr;
+  }
+}
+function sortDirsDeepestFirst(dirs) {
+  const unique = /* @__PURE__ */ new Map();
+  for (const dir of dirs) {
+    const key = normalizeForCompare(dir);
+    if (!unique.has(key)) {
+      unique.set(key, dir);
+    }
+  }
+  return [...unique.values()].sort((a, b) => {
+    const depthDiff = toPosixPath(b).split("/").length - toPosixPath(a).split("/").length;
+    if (depthDiff !== 0) return depthDiff;
+    return b.length - a.length;
+  });
+}
+async function simulatePrunedDirs(plans, realBaseCwd) {
+  const candidateStartDirs = [];
+  const populatedDirs = /* @__PURE__ */ new Set();
+  const keptDestKeys = /* @__PURE__ */ new Set();
+  const markAncestorsPopulated = (filePath) => {
+    keptDestKeys.add(normalizeForCompare(filePath));
+    let dir = path3.dirname(filePath);
+    while (isStrictlyInsideDir(dir, realBaseCwd)) {
+      const key = normalizeForCompare(dir);
+      if (populatedDirs.has(key)) break;
+      populatedDirs.add(key);
+      dir = path3.dirname(dir);
+    }
+  };
+  for (const plan of plans) {
+    if (plan.kind === "write") {
+      markAncestorsPopulated(plan.writeTargetPath);
+    } else if (plan.kind === "move") {
+      markAncestorsPopulated(plan.destPath);
+      if (plan.pruneEmptyDirs) {
+        candidateStartDirs.push(path3.dirname(plan.sourcePath));
+      }
+    } else if (plan.kind === "delete" && plan.pruneEmptyDirs) {
+      candidateStartDirs.push(path3.dirname(plan.sourcePath));
+    }
+  }
+  if (candidateStartDirs.length === 0) return [];
+  const removedByDir = /* @__PURE__ */ new Map();
+  const markRemoved = (entryPath) => {
+    const parentKey = normalizeForCompare(path3.dirname(entryPath));
+    let set = removedByDir.get(parentKey);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      removedByDir.set(parentKey, set);
+    }
+    set.add(normalizeEntryName(path3.basename(entryPath)));
+  };
+  for (const plan of plans) {
+    if (plan.kind === "delete" || plan.kind === "move") {
+      if (!keptDestKeys.has(normalizeForCompare(plan.sourcePath))) {
+        markRemoved(plan.sourcePath);
+      }
+    }
+  }
+  const prunedDirs = [];
+  const prunedKeys = /* @__PURE__ */ new Set();
+  for (const startDir of sortDirsDeepestFirst(candidateStartDirs)) {
+    let current = startDir;
+    while (isStrictlyInsideDir(current, realBaseCwd) && !isInsideGitDir(current, realBaseCwd)) {
+      const key = normalizeForCompare(current);
+      if (prunedKeys.has(key)) {
+        current = path3.dirname(current);
+        continue;
+      }
+      if (populatedDirs.has(key)) break;
+      let lst;
+      try {
+        lst = await fs2.lstat(current);
+      } catch {
+        break;
+      }
+      if (lst.isSymbolicLink() || !lst.isDirectory()) break;
+      let entries;
+      try {
+        entries = await fs2.readdir(current);
+      } catch {
+        break;
+      }
+      const removedInThisDir = removedByDir.get(key);
+      const allRemoved = entries.every(
+        (name) => removedInThisDir?.has(normalizeEntryName(name)) ?? false
+      );
+      if (!allRemoved) break;
+      prunedKeys.add(key);
+      prunedDirs.push(current);
+      markRemoved(current);
+      current = path3.dirname(current);
+    }
+  }
+  return prunedDirs;
+}
+async function commitPlannedOperations(plans, realBaseCwd) {
+  const undoLog = [];
+  const sidecarBackups = [];
+  const stagedMoveSources = /* @__PURE__ */ new Map();
+  const prunedDirs = [];
+  const needsTxDir = plans.some((p) => p.kind === "delete" || p.kind === "move");
+  const txDir = path3.join(
+    realBaseCwd,
+    `.agy-fast-tx-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  );
+  let txDirCreated = false;
+  let txSeq = 0;
+  const ensureTxDir = async () => {
+    if (!txDirCreated) {
+      await fs2.mkdir(txDir, { recursive: true });
+      txDirCreated = true;
+    }
+  };
+  const stageMoveOut = async (sourcePath, allowSameDirFallback) => {
+    await ensureTxDir();
+    const txSlot = path3.join(txDir, `item-${txSeq++}`);
+    try {
+      await fs2.rename(sourcePath, txSlot);
+      undoLog.push({ kind: "restore-rename", from: txSlot, to: sourcePath });
+      return txSlot;
+    } catch (err) {
+      if (err?.code === "EXDEV") {
+        if (allowSameDirFallback) {
+          const localBackup = `${sourcePath}.agy-fast-del-${process.pid}-${Date.now()}-${txSeq++}`;
+          await fs2.rename(sourcePath, localBackup);
+          sidecarBackups.push(localBackup);
+          undoLog.push({ kind: "restore-rename", from: localBackup, to: sourcePath });
+          return localBackup;
+        }
+        throw new Error(
+          `Cannot atomically stage '${sourcePath}' across filesystems (EXDEV)`
+        );
+      }
+      throw err;
+    }
+  };
+  try {
+    if (needsTxDir) {
+      for (const plan of plans) {
+        if (plan.kind === "delete") {
+          await stageMoveOut(plan.sourcePath, !plan.pruneEmptyDirs);
+        }
+      }
+      for (const plan of plans) {
+        if (plan.kind === "move") {
+          const stagedSrc = await stageMoveOut(plan.sourcePath, false);
+          stagedMoveSources.set(plan, stagedSrc);
+        }
+      }
+      for (const plan of plans) {
+        if (plan.kind === "move" && plan.destExisted && !plan.isCaseOnlySelfRename) {
+          let stillExists = false;
+          try {
+            await fs2.lstat(plan.destPath);
+            stillExists = true;
+          } catch (err) {
+            if (err?.code !== "ENOENT") {
+              throw err;
+            }
           }
-        } else if (!item.existed) {
-          await fs2.unlink(target);
+          if (stillExists) {
+            await stageMoveOut(plan.destPath, true);
+          }
+        }
+      }
+    }
+    for (const plan of plans) {
+      if (plan.kind !== "move") continue;
+      if (plan.newContent === void 0) {
+        await fs2.mkdir(path3.dirname(plan.destPath), { recursive: true });
+        const stagedSrc = stagedMoveSources.get(plan);
+        await fs2.rename(stagedSrc, plan.destPath);
+        undoLog.push({ kind: "unmove-to-tx", from: plan.destPath, to: stagedSrc });
+      } else {
+        await writeFileAtomically({
+          target: plan.destPath,
+          content: plan.newContent,
+          mode: plan.originalMode ?? null,
+          onCommitted: () => {
+            undoLog.push({ kind: "unlink-created", target: plan.destPath });
+          }
+        });
+      }
+    }
+    for (const plan of plans) {
+      if (plan.kind !== "write") continue;
+      await writeFileAtomically({
+        target: plan.writeTargetPath,
+        content: plan.newContent,
+        mode: plan.originalMode,
+        originalSymlinkTarget: plan.originalSymlinkTarget,
+        onCommitted: () => {
+          undoLog.push({ kind: "restore-write", plan });
+        }
+      });
+    }
+    const candidateStartDirs = [];
+    for (const plan of plans) {
+      if ((plan.kind === "delete" || plan.kind === "move") && plan.pruneEmptyDirs) {
+        candidateStartDirs.push(path3.dirname(plan.sourcePath));
+      }
+    }
+    const prunedKeys = /* @__PURE__ */ new Set();
+    for (const startDir of sortDirsDeepestFirst(candidateStartDirs)) {
+      let current = startDir;
+      while (isStrictlyInsideDir(current, realBaseCwd) && !isInsideGitDir(current, realBaseCwd)) {
+        const key = normalizeForCompare(current);
+        if (prunedKeys.has(key)) {
+          current = path3.dirname(current);
+          continue;
+        }
+        let lst;
+        try {
+          lst = await fs2.lstat(current);
+        } catch {
+          break;
+        }
+        if (lst.isSymbolicLink() || !lst.isDirectory()) break;
+        let entries;
+        try {
+          entries = await fs2.readdir(current);
+        } catch {
+          break;
+        }
+        if (entries.length > 0) break;
+        try {
+          await fs2.rmdir(current);
+        } catch (rmdirErr) {
+          const code = rmdirErr?.code;
+          if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOENT") {
+            break;
+          }
+          throw rmdirErr;
+        }
+        prunedKeys.add(key);
+        prunedDirs.push(current);
+        undoLog.push({ kind: "mkdir", dir: current });
+        current = path3.dirname(current);
+      }
+    }
+    if (txDirCreated) {
+      await fs2.rm(txDir, { recursive: true, force: true }).catch(() => {
+      });
+    }
+    for (const backup of sidecarBackups) {
+      await fs2.unlink(backup).catch(() => {
+      });
+    }
+    return { prunedDirs };
+  } catch (err) {
+    for (let i = undoLog.length - 1; i >= 0; i--) {
+      const action = undoLog[i];
+      try {
+        if (action.kind === "mkdir") {
+          await fs2.mkdir(action.dir, { recursive: true });
+        } else if (action.kind === "unlink-created") {
+          await fs2.unlink(action.target);
+        } else if (action.kind === "unmove-to-tx") {
+          await fs2.mkdir(path3.dirname(action.to), { recursive: true });
+          await fs2.rename(action.from, action.to);
+        } else if (action.kind === "restore-rename") {
+          await fs2.mkdir(path3.dirname(action.to), { recursive: true });
+          await fs2.rename(action.from, action.to);
+        } else if (action.kind === "restore-write") {
+          const item = action.plan;
+          const target = item.writeTargetPath;
+          if (item.originalSymlinkTarget) {
+            await fs2.unlink(target).catch(() => {
+            });
+            await fs2.symlink(item.originalSymlinkTarget, target);
+          } else if (item.existed && item.originalBuffer !== null) {
+            await fs2.writeFile(target, item.originalBuffer);
+            if (item.originalMode !== null && process.platform !== "win32") {
+              await fs2.chmod(target, item.originalMode);
+            }
+          } else if (!item.existed) {
+            await fs2.unlink(target);
+          }
         }
       } catch {
       }
+    }
+    if (txDirCreated) {
+      await fs2.rmdir(txDir).catch(() => {
+      });
     }
     throw err;
   }
@@ -1713,7 +2020,10 @@ async function runApplyEdits(input) {
       path: rawEntry.path,
       hunks: normalizedHunks,
       create: rawEntry.create,
-      overwrite: rawEntry.overwrite
+      overwrite: rawEntry.overwrite,
+      delete: rawEntry.delete,
+      moveTo: rawEntry.moveTo,
+      pruneEmptyDirs: rawEntry.pruneEmptyDirs
     });
   }
   if (corruptedItems.length > 0) {
@@ -1759,8 +2069,22 @@ async function runApplyEdits(input) {
       };
     }
   }
+  if (input.pruneEmptyDirs !== void 0 && typeof input.pruneEmptyDirs !== "boolean") {
+    return {
+      text: "Validation failed (0 files modified):\n- 'pruneEmptyDirs' must be a boolean.",
+      isError: true
+    };
+  }
   const baseCwd = resolvePath(input.cwd || process.cwd());
-  const mergedByPath = /* @__PURE__ */ new Map();
+  let realBaseCwd = baseCwd;
+  try {
+    realBaseCwd = await fs2.realpath(baseCwd);
+  } catch {
+  }
+  const opItems = [];
+  const hunksByTarget = /* @__PURE__ */ new Map();
+  const sourceConsumers = /* @__PURE__ */ new Map();
+  const destWriters = /* @__PURE__ */ new Map();
   const errors = [];
   for (let i = 0; i < normalizedEdits.length; i++) {
     const entry = normalizedEdits[i];
@@ -1768,7 +2092,98 @@ async function runApplyEdits(input) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
       continue;
     }
+    if (entry.delete !== void 0 && typeof entry.delete !== "boolean") {
+      errors.push(`edits[${i}]: 'delete' must be a boolean`);
+      continue;
+    }
+    if (entry.moveTo !== void 0 && (typeof entry.moveTo !== "string" || !entry.moveTo.trim())) {
+      errors.push(`edits[${i}]: 'moveTo' must be a non-empty string`);
+      continue;
+    }
+    if (entry.pruneEmptyDirs !== void 0 && typeof entry.pruneEmptyDirs !== "boolean") {
+      errors.push(`edits[${i}]: 'pruneEmptyDirs' must be a boolean`);
+      continue;
+    }
+    if (entry.overwrite !== void 0 && typeof entry.overwrite !== "boolean") {
+      errors.push(`edits[${i}]: 'overwrite' must be a boolean`);
+      continue;
+    }
     const absPath = resolvePath(entry.path, baseCwd);
+    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
+    const hasDelete = entry.delete === true;
+    const hasCreate = typeof entry.create === "string";
+    const hasMove = typeof entry.moveTo === "string";
+    const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
+    if (!hasDelete && !hasCreate && !hasMove && !hasHunks) {
+      errors.push(
+        `${relPath}: must specify 'hunks', 'create', 'delete: true', or 'moveTo'`
+      );
+      continue;
+    }
+    if (hasDelete && (hasCreate || hasHunks || hasMove)) {
+      errors.push(
+        `${relPath}: cannot combine 'delete' with 'create', 'hunks', or 'moveTo'`
+      );
+      continue;
+    }
+    if (hasCreate && (hasHunks || hasMove)) {
+      errors.push(`${relPath}: cannot specify both 'create' and '${hasMove ? "moveTo" : "hunks"}' on the same entry`);
+      continue;
+    }
+    const effectivePruneEmptyDirs = entry.pruneEmptyDirs ?? input.pruneEmptyDirs ?? false;
+    if (hasDelete) {
+      const sourcePath = await canonicalizePreserveLeaf(absPath);
+      const sourceKey = normalizeForCompare(sourcePath);
+      const existingConsumer2 = sourceConsumers.get(sourceKey);
+      if (existingConsumer2) {
+        errors.push(`${relPath}: duplicate entries cannot mix 'delete' with other edits on the same file`);
+        continue;
+      }
+      const item2 = {
+        kind: "delete",
+        absPath,
+        sourcePath,
+        relPath,
+        pruneEmptyDirs: effectivePruneEmptyDirs
+      };
+      sourceConsumers.set(sourceKey, item2);
+      opItems.push(item2);
+      continue;
+    }
+    if (hasMove) {
+      const sourcePath = await canonicalizePreserveLeaf(absPath);
+      const destAbsPath = resolvePath(entry.moveTo, baseCwd);
+      const destPath = await canonicalizePreserveLeaf(destAbsPath);
+      const destRelPath = toPosixPath(path3.relative(baseCwd, destAbsPath)) || path3.basename(destAbsPath);
+      const sourceKey = normalizeForCompare(sourcePath);
+      const destKey = normalizeForCompare(destPath);
+      if (sourceConsumers.has(sourceKey)) {
+        errors.push(
+          `${relPath}: duplicate source entry for 'moveTo' (combine 'hunks' and 'moveTo' on the same entry)`
+        );
+        continue;
+      }
+      if (destWriters.has(destKey)) {
+        errors.push(`${destRelPath}: duplicate destination path across entries`);
+        continue;
+      }
+      const item2 = {
+        kind: "move",
+        absPath,
+        sourcePath,
+        destAbsPath,
+        destPath,
+        relPath,
+        destRelPath,
+        overwrite: entry.overwrite,
+        pruneEmptyDirs: effectivePruneEmptyDirs,
+        hunks: hasHunks ? [...entry.hunks] : []
+      };
+      sourceConsumers.set(sourceKey, item2);
+      destWriters.set(destKey, item2);
+      opItems.push(item2);
+      continue;
+    }
     let writeTargetPath = absPath;
     try {
       writeTargetPath = await fs2.realpath(absPath);
@@ -1779,34 +2194,57 @@ async function runApplyEdits(input) {
       } catch {
       }
     }
-    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
-    const hasCreate = typeof entry.create === "string";
-    const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
-    if (!hasCreate && !hasHunks) {
-      errors.push(`${relPath}: must specify either non-empty 'hunks' or 'create'`);
-      continue;
-    }
-    if (hasCreate && hasHunks) {
-      errors.push(`${relPath}: cannot specify both 'create' and 'hunks' on the same entry`);
-      continue;
-    }
-    const existing = mergedByPath.get(writeTargetPath);
-    if (!existing) {
-      mergedByPath.set(writeTargetPath, {
+    const targetKey = normalizeForCompare(writeTargetPath);
+    if (hasCreate) {
+      const existingDest2 = destWriters.get(targetKey);
+      if (existingDest2) {
+        errors.push(
+          existingDest2.kind === "hunks" || existingDest2.kind === "create" ? `${relPath}: duplicate entries cannot mix 'create' with other edits` : `${relPath}: duplicate destination path across entries`
+        );
+        continue;
+      }
+      const item2 = {
+        kind: "create",
         absPath,
         writeTargetPath,
         relPath,
-        create: hasCreate ? entry.create : void 0,
-        overwrite: entry.overwrite,
-        hunks: hasHunks ? [...entry.hunks] : []
-      });
-    } else {
-      if (hasCreate || existing.create !== void 0) {
-        errors.push(`${relPath}: duplicate entries cannot mix 'create' with other edits`);
-        continue;
-      }
-      existing.hunks.push(...entry.hunks);
+        create: entry.create,
+        overwrite: entry.overwrite
+      };
+      destWriters.set(targetKey, item2);
+      opItems.push(item2);
+      continue;
     }
+    const existingHunks = hunksByTarget.get(targetKey);
+    if (existingHunks) {
+      existingHunks.hunks.push(...entry.hunks);
+      continue;
+    }
+    const existingDest = destWriters.get(targetKey);
+    if (existingDest) {
+      errors.push(
+        existingDest.kind === "create" ? `${relPath}: duplicate entries cannot mix 'create' with other edits` : `${relPath}: duplicate destination path across entries`
+      );
+      continue;
+    }
+    const existingConsumer = sourceConsumers.get(targetKey);
+    if (existingConsumer) {
+      errors.push(
+        `${relPath}: cannot edit a file that is also being deleted or moved in the same batch`
+      );
+      continue;
+    }
+    const item = {
+      kind: "hunks",
+      absPath,
+      writeTargetPath,
+      relPath,
+      hunks: [...entry.hunks]
+    };
+    hunksByTarget.set(targetKey, item);
+    sourceConsumers.set(targetKey, item);
+    destWriters.set(targetKey, item);
+    opItems.push(item);
   }
   if (errors.length > 0) {
     return {
@@ -1815,10 +2253,162 @@ async function runApplyEdits(input) {
       isError: true
     };
   }
-  const plans = [];
-  for (const item of mergedByPath.values()) {
-    if (item.create !== void 0) {
+  const readyPlans = [];
+  const pendingCreates = [];
+  const pendingMoves = [];
+  for (const item of opItems) {
+    if (item.kind === "delete") {
+      if (!isStrictlyInsideDir(item.sourcePath, realBaseCwd)) {
+        errors.push(
+          `${item.relPath}: delete path must be strictly inside cwd (${toPosixPath(realBaseCwd)})`
+        );
+        continue;
+      }
+      if (isInsideGitDir(item.sourcePath, realBaseCwd)) {
+        errors.push(`${item.relPath}: refusing to delete files inside '.git'`);
+        continue;
+      }
+      let lst;
+      try {
+        lst = await fs2.lstat(item.sourcePath);
+      } catch (err) {
+        errors.push(
+          `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
+      if (lst.isDirectory()) {
+        errors.push(
+          `${item.relPath}: target path is a directory ('delete' only removes files/symlinks; use pruneEmptyDirs: true to remove empty parent directories)`
+        );
+        continue;
+      }
+      readyPlans.push({
+        kind: "delete",
+        absPath: item.absPath,
+        sourcePath: item.sourcePath,
+        relPath: item.relPath,
+        pruneEmptyDirs: item.pruneEmptyDirs
+      });
+      continue;
+    }
+    if (item.kind === "move") {
+      if (!isStrictlyInsideDir(item.sourcePath, realBaseCwd)) {
+        errors.push(
+          `${item.relPath}: move source path must be strictly inside cwd (${toPosixPath(realBaseCwd)})`
+        );
+        continue;
+      }
+      if (!isStrictlyInsideDir(item.destPath, realBaseCwd)) {
+        errors.push(
+          `${item.destRelPath}: move destination path must be strictly inside cwd (${toPosixPath(realBaseCwd)})`
+        );
+        continue;
+      }
+      if (isInsideGitDir(item.sourcePath, realBaseCwd) || isInsideGitDir(item.destPath, realBaseCwd)) {
+        errors.push(`${item.relPath}: refusing to move files into or out of '.git'`);
+        continue;
+      }
+      if (item.sourcePath === item.destPath) {
+        errors.push(`${item.relPath}: move source and destination resolve to the same path`);
+        continue;
+      }
+      const isCaseOnlySelfRename = isCaseInsensitivePlatform() && normalizeForCompare(item.sourcePath) === normalizeForCompare(item.destPath) && item.sourcePath !== item.destPath;
+      let srcLstat;
+      try {
+        srcLstat = await fs2.lstat(item.sourcePath);
+      } catch (err) {
+        errors.push(
+          `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
+      if (srcLstat.isDirectory()) {
+        errors.push(
+          `${item.relPath}: move source is a directory ('moveTo' only moves files/symlinks)`
+        );
+        continue;
+      }
+      let newContent;
+      let originalMode;
+      let hunkCount;
+      let lineDelta2;
+      if (item.hunks.length > 0) {
+        if (srcLstat.isSymbolicLink()) {
+          errors.push(
+            `${item.relPath}: cannot combine 'moveTo' with 'hunks' on a symbolic link`
+          );
+          continue;
+        }
+        let fileData2;
+        try {
+          fileData2 = await readTextFile(item.sourcePath);
+        } catch (err) {
+          errors.push(
+            `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`
+          );
+          continue;
+        }
+        const normalizedOriginal2 = fileData2.content.replace(/\r\n/g, "\n");
+        const planned2 = planHunksForContent(normalizedOriginal2, item.hunks, item.relPath);
+        if (planned2.errors.length > 0) {
+          errors.push(...planned2.errors);
+          continue;
+        }
+        newContent = fileData2.eol === "\r\n" ? planned2.newNormalized.replace(/\n/g, "\r\n") : planned2.newNormalized;
+        originalMode = fileData2.mode;
+        hunkCount = planned2.appliedMatches;
+        lineDelta2 = countLines(planned2.newNormalized) - countLines(normalizedOriginal2);
+      }
+      let destExists = false;
+      if (!isCaseOnlySelfRename) {
+        try {
+          const destLst = await fs2.lstat(item.destPath);
+          if (destLst.isDirectory()) {
+            errors.push(`${item.destRelPath}: move destination path is a directory`);
+            continue;
+          }
+          if (destLst.isSymbolicLink()) {
+            try {
+              const destSt = await fs2.stat(item.destPath);
+              if (destSt.isDirectory()) {
+                errors.push(`${item.destRelPath}: move destination path is a directory`);
+                continue;
+              }
+            } catch (statErr) {
+              if (statErr?.code !== "ENOENT") {
+                errors.push(
+                  `${item.destRelPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
+                );
+                continue;
+              }
+            }
+          }
+          destExists = true;
+        } catch (err) {
+          if (err?.code !== "ENOENT") {
+            errors.push(
+              `${item.destRelPath}: ${err instanceof Error ? err.message : String(err)}`
+            );
+            continue;
+          }
+        }
+      }
+      pendingMoves.push({
+        kind: "pending-move",
+        item,
+        isCaseOnlySelfRename,
+        destExists,
+        newContent,
+        originalMode,
+        hunkCount,
+        lineDelta: lineDelta2
+      });
+      continue;
+    }
+    if (item.kind === "create") {
       let exists = false;
+      let isDanglingSymlink = false;
       let originalBuffer = null;
       let originalMode = null;
       let originalSymlinkTarget = null;
@@ -1832,23 +2422,12 @@ async function runApplyEdits(input) {
               continue;
             }
             exists = true;
-            if (!item.overwrite) {
-              errors.push(
-                `${item.relPath}: file already exists (set overwrite: true to replace it)`
-              );
-              continue;
-            }
             originalMode = st.mode & 4095;
             originalBuffer = await fs2.readFile(item.writeTargetPath);
           } catch (statErr) {
             if (statErr?.code === "ENOENT") {
               exists = true;
-              if (!item.overwrite) {
-                errors.push(
-                  `${item.relPath}: dangling symlink already exists (set overwrite: true to replace it)`
-                );
-                continue;
-              }
+              isDanglingSymlink = true;
               originalSymlinkTarget = await fs2.readlink(item.writeTargetPath);
             } else {
               errors.push(
@@ -1864,12 +2443,6 @@ async function runApplyEdits(input) {
             continue;
           }
           exists = true;
-          if (!item.overwrite) {
-            errors.push(
-              `${item.relPath}: file already exists (set overwrite: true to replace it)`
-            );
-            continue;
-          }
           originalMode = st.mode & 4095;
           originalBuffer = await fs2.readFile(item.writeTargetPath);
         }
@@ -1885,20 +2458,14 @@ async function runApplyEdits(input) {
           continue;
         }
       }
-      const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
-      const newLines = countLines(item.create);
-      plans.push({
-        absPath: item.absPath,
-        writeTargetPath: item.writeTargetPath,
-        relPath: item.relPath,
-        existed: exists,
+      pendingCreates.push({
+        kind: "pending-create",
+        item,
+        exists,
+        isDanglingSymlink,
         originalBuffer,
         originalMode,
-        originalSymlinkTarget,
-        newContent: item.create,
-        hunkCount: 1,
-        lineDelta: newLines - oldLines,
-        created: !exists
+        originalSymlinkTarget
       });
       continue;
     }
@@ -1919,7 +2486,8 @@ async function runApplyEdits(input) {
     }
     const finalContent = fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
     const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
-    plans.push({
+    readyPlans.push({
+      kind: "write",
       absPath: item.absPath,
       writeTargetPath: item.writeTargetPath,
       relPath: item.relPath,
@@ -1930,6 +2498,88 @@ async function runApplyEdits(input) {
       hunkCount: planned.appliedMatches,
       lineDelta,
       created: false
+    });
+  }
+  let survivingMoves = pendingMoves;
+  while (true) {
+    const vacatedKeys = /* @__PURE__ */ new Set();
+    for (const p of readyPlans) {
+      if (p.kind === "delete") {
+        vacatedKeys.add(normalizeForCompare(p.sourcePath));
+      }
+    }
+    for (const m of survivingMoves) {
+      vacatedKeys.add(normalizeForCompare(m.item.sourcePath));
+    }
+    const nextMoves = [];
+    let dropped = false;
+    for (const m of survivingMoves) {
+      if (m.destExists && !m.isCaseOnlySelfRename && !vacatedKeys.has(normalizeForCompare(m.item.destPath)) && !m.item.overwrite) {
+        errors.push(
+          `${m.item.destRelPath}: move destination already exists (set overwrite: true to replace it)`
+        );
+        dropped = true;
+      } else {
+        nextMoves.push(m);
+      }
+    }
+    survivingMoves = nextMoves;
+    if (!dropped) break;
+  }
+  const finalVacatedKeys = /* @__PURE__ */ new Set();
+  for (const p of readyPlans) {
+    if (p.kind === "delete") {
+      finalVacatedKeys.add(normalizeForCompare(p.sourcePath));
+    }
+  }
+  for (const m of survivingMoves) {
+    finalVacatedKeys.add(normalizeForCompare(m.item.sourcePath));
+  }
+  const plans = [...readyPlans];
+  for (const m of survivingMoves) {
+    const destVacated = finalVacatedKeys.has(normalizeForCompare(m.item.destPath));
+    plans.push({
+      kind: "move",
+      absPath: m.item.absPath,
+      sourcePath: m.item.sourcePath,
+      destAbsPath: m.item.destAbsPath,
+      destPath: m.item.destPath,
+      relPath: m.item.relPath,
+      destRelPath: m.item.destRelPath,
+      isCaseOnlySelfRename: m.isCaseOnlySelfRename,
+      destExisted: m.destExists && !destVacated,
+      pruneEmptyDirs: m.item.pruneEmptyDirs,
+      newContent: m.newContent,
+      originalMode: m.originalMode,
+      hunkCount: m.hunkCount,
+      lineDelta: m.lineDelta
+    });
+  }
+  for (const c of pendingCreates) {
+    const targetVacated = finalVacatedKeys.has(normalizeForCompare(c.item.writeTargetPath));
+    if (c.exists && !targetVacated && !c.item.overwrite) {
+      errors.push(
+        c.isDanglingSymlink ? `${c.item.relPath}: dangling symlink already exists (set overwrite: true to replace it)` : `${c.item.relPath}: file already exists (set overwrite: true to replace it)`
+      );
+      continue;
+    }
+    const effectiveExisted = c.exists && !targetVacated;
+    const effectiveOrigBuf = effectiveExisted ? c.originalBuffer : null;
+    const oldLines = effectiveOrigBuf ? countLines(effectiveOrigBuf.toString("utf8")) : 0;
+    const newLines = countLines(c.item.create);
+    plans.push({
+      kind: "write",
+      absPath: c.item.absPath,
+      writeTargetPath: c.item.writeTargetPath,
+      relPath: c.item.relPath,
+      existed: effectiveExisted,
+      originalBuffer: effectiveOrigBuf,
+      originalMode: effectiveExisted ? c.originalMode : null,
+      originalSymlinkTarget: effectiveExisted ? c.originalSymlinkTarget : null,
+      newContent: c.item.create,
+      hunkCount: 1,
+      lineDelta: newLines - oldLines,
+      created: !effectiveExisted
     });
   }
   const bestEffort = Boolean(input.bestEffort);
@@ -1944,29 +2594,52 @@ async function runApplyEdits(input) {
       isError: true
     };
   }
+  let prunedDirs = [];
   if (!input.dryRun) {
     try {
-      await commitPlannedWrites(plans);
+      const committed = await commitPlannedOperations(plans, realBaseCwd);
+      prunedDirs = committed.prunedDirs;
     } catch (err) {
       return {
         text: `Write failed (changes rolled back): ${err instanceof Error ? err.message : String(err)}`,
         isError: true
       };
     }
+  } else {
+    prunedDirs = await simulatePrunedDirs(plans, realBaseCwd);
   }
   const summaryLines = plans.map((p) => {
+    if (p.kind === "delete") {
+      return `- ${p.relPath}: deleted`;
+    }
+    if (p.kind === "move") {
+      if (p.newContent !== void 0) {
+        const delta = p.lineDelta ?? 0;
+        const deltaStr2 = delta >= 0 ? `+${delta}` : `${delta}`;
+        const matches = p.hunkCount ?? 0;
+        return `- ${p.relPath} -> ${p.destRelPath}: moved & updated (${matches} match${matches === 1 ? "" : "es"}), lines ${deltaStr2}`;
+      }
+      return `- ${p.relPath} -> ${p.destRelPath}: moved`;
+    }
     const deltaStr = p.lineDelta >= 0 ? `+${p.lineDelta}` : `${p.lineDelta}`;
     const action = p.created ? "created" : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
     return `- ${p.relPath}: ${action}, lines ${deltaStr}`;
   });
+  const prunedRelPaths = prunedDirs.map(
+    (d) => toPosixPath(path3.relative(realBaseCwd, d)) || path3.basename(d)
+  );
+  const prunedNotice = prunedRelPaths.length > 0 ? `${input.dryRun ? "Would prune" : "Pruned"} empty dir(s): ${prunedRelPaths.join(", ")}` : null;
   if (bestEffort && errors.length > 0) {
-    const totalFiles = mergedByPath.size;
+    const totalFiles = opItems.length;
     const failedFileCount = Math.max(1, totalFiles - plans.length);
     const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
+    const appliedBody = prunedNotice ? `Applied:
+${summaryLines.join("\n")}
+${prunedNotice}` : `Applied:
+${summaryLines.join("\n")}`;
     const partialParts = [
       partialHeader,
-      `Applied:
-${summaryLines.join("\n")}`,
+      appliedBody,
       `Failed (fix only these):
 - ${errors.join("\n- ")}`
     ];
@@ -1984,8 +2657,12 @@ ${summaryLines.join("\n")}`,
     };
   }
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
-  const parts = [`${header}
-${summaryLines.join("\n")}`];
+  const parts = [
+    prunedNotice ? `${header}
+${summaryLines.join("\n")}
+${prunedNotice}` : `${header}
+${summaryLines.join("\n")}`
+  ];
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
@@ -5146,19 +5823,19 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "apply_edits",
-      description: "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+      description: "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation, deletion, move/rename, empty parent directory pruning, and inline verify command.",
       inputSchema: {
         type: "object",
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative file paths and verify command."
+            description: "Base directory for relative file paths, delete/move scope boundary, and verify command."
           },
           edits: {
             type: "array",
             minItems: 1,
             maxItems: 50,
-            description: "Files to edit or create.",
+            description: "Files to edit, create, delete, or move/rename.",
             items: {
               type: "object",
               properties: {
@@ -5194,7 +5871,19 @@ function createAgyFastServer() {
                 },
                 overwrite: {
                   type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'."
+                  description: "Allow overwriting an existing target file when using 'create' or 'moveTo'."
+                },
+                delete: {
+                  type: "boolean",
+                  description: "Delete the file or symlink at 'path' (strictly inside cwd; mutually exclusive with hunks/create/moveTo; staged via same-filesystem rename for O(1) rollback)."
+                },
+                moveTo: {
+                  type: "string",
+                  description: "Move or rename the file at 'path' to this destination path (strictly inside cwd; may be combined with 'hunks' to move and edit in one step)."
+                },
+                pruneEmptyDirs: {
+                  type: "boolean",
+                  description: "When deleting or moving a file, recursively remove empty parent directories strictly inside cwd (overrides top-level pruneEmptyDirs)."
                 }
               },
               required: ["path"]
@@ -5202,11 +5891,15 @@ function createAgyFastServer() {
           },
           dryRun: {
             type: "boolean",
-            description: "Validate all hunks without writing files (default false)."
+            description: "Validate all operations without modifying files (default false)."
           },
           bestEffort: {
             type: "boolean",
-            description: "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
+            description: "When true, apply valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
+          },
+          pruneEmptyDirs: {
+            type: "boolean",
+            description: "Batch default for removing empty source parent directories after 'delete' or 'moveTo' operations (strictly inside cwd; default false)."
           },
           verify: {
             type: "string",

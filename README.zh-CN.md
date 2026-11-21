@@ -188,7 +188,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 
 ### 2. `apply_edits` — 原子多处/跨文件编辑 + 内联校验
 - **单次最多 50 个文件**：默认全内存预校验后原子写入（任意失配或重叠均不改动磁盘）；大批量可传 `bestEffort: true` 按文件原子提交成功项，并对失败项自动返回最相近代码行与行号漂移提示，便于精准重试。
-- **无损保留文件属性**：保留 CRLF 换行符、文件权限与软链接；支持 `startLine`/`endLine`、`replaceAll`、`create`/`overwrite` 与 `dryRun`。
+- **无损保留文件属性**：保留 CRLF 换行符、文件权限与软链接；支持 `startLine`/`endLine`、`replaceAll`、`create`/`overwrite`、`delete`、`moveTo`（可单用或与 `hunks` 组合）、`pruneEmptyDirs`（严格在 `cwd` 边界内清理变空父目录，并通过同盘 `rename` 暂存实现大文件 O(1) 无损回滚）与 `dryRun`。
 - **可选内联 `verify`**：落盘后直接执行构建/类型检查/测试命令，自动过滤 Pino/Bunyan info JSON 与 Maven 尾注噪声，保留核心报错根因。
 
 ### 3. `read_slices` — 多语言符号大纲与精确切片读取

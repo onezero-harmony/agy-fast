@@ -104,19 +104,19 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "apply_edits",
       description:
-        "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+        "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation, deletion, move/rename, empty parent directory pruning, and inline verify command.",
       inputSchema: {
         type: "object",
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative file paths and verify command.",
+            description: "Base directory for relative file paths, delete/move scope boundary, and verify command.",
           },
           edits: {
             type: "array",
             minItems: 1,
             maxItems: 50,
-            description: "Files to edit or create.",
+            description: "Files to edit, create, delete, or move/rename.",
             items: {
               type: "object",
               properties: {
@@ -152,7 +152,22 @@ export function createAgyFastServer(): McpStdioServer {
                 },
                 overwrite: {
                   type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'.",
+                  description: "Allow overwriting an existing target file when using 'create' or 'moveTo'.",
+                },
+                delete: {
+                  type: "boolean",
+                  description:
+                    "Delete the file or symlink at 'path' (strictly inside cwd; mutually exclusive with hunks/create/moveTo; staged via same-filesystem rename for O(1) rollback).",
+                },
+                moveTo: {
+                  type: "string",
+                  description:
+                    "Move or rename the file at 'path' to this destination path (strictly inside cwd; may be combined with 'hunks' to move and edit in one step).",
+                },
+                pruneEmptyDirs: {
+                  type: "boolean",
+                  description:
+                    "When deleting or moving a file, recursively remove empty parent directories strictly inside cwd (overrides top-level pruneEmptyDirs).",
                 },
               },
               required: ["path"],
@@ -160,12 +175,17 @@ export function createAgyFastServer(): McpStdioServer {
           },
           dryRun: {
             type: "boolean",
-            description: "Validate all hunks without writing files (default false).",
+            description: "Validate all operations without modifying files (default false).",
           },
           bestEffort: {
             type: "boolean",
             description:
-              "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing).",
+              "When true, apply valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing).",
+          },
+          pruneEmptyDirs: {
+            type: "boolean",
+            description:
+              "Batch default for removing empty source parent directories after 'delete' or 'moveTo' operations (strictly inside cwd; default false).",
           },
           verify: {
             type: "string",

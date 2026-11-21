@@ -849,4 +849,411 @@ describe("apply_edits", () => {
       false,
     );
   });
+
+  it("deletes files via zero-copy staging, prunes empty parent dirs, and honors dryRun", async () => {
+    const subDir = path.join(tmpDir, "delete-prune");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+
+    const deepFile = path.join(realSubDir, "deep", "nested", "leaf", "only.bin");
+    const partialFile = path.join(realSubDir, "partial", "sub", "last.txt");
+    const partialKeep = path.join(realSubDir, "partial", "keep.txt");
+    const overrideFile = path.join(realSubDir, "keep-empty", "gone.txt");
+    const sameDirOld = path.join(realSubDir, "same-dir", "old.txt");
+
+    await fs.mkdir(path.dirname(deepFile), { recursive: true });
+    await fs.mkdir(path.dirname(partialFile), { recursive: true });
+    await fs.mkdir(path.dirname(overrideFile), { recursive: true });
+    await fs.mkdir(path.dirname(sameDirOld), { recursive: true });
+
+    await fs.writeFile(deepFile, Buffer.from([0x00, 0x01, 0xff, 0x42]));
+    await fs.writeFile(partialFile, "bye\n", "utf8");
+    await fs.writeFile(partialKeep, "stay\n", "utf8");
+    await fs.writeFile(overrideFile, "gone\n", "utf8");
+    await fs.writeFile(sameDirOld, "old\n", "utf8");
+
+    // Dry-run previews pruned dirs accurately without modifying disk
+    const dryRes = await runApplyEdits({
+      cwd: realSubDir,
+      dryRun: true,
+      pruneEmptyDirs: true,
+      edits: [
+        { path: "deep/nested/leaf/only.bin", delete: true },
+        { path: "partial/sub/last.txt", delete: true },
+        { path: "keep-empty/gone.txt", delete: true, pruneEmptyDirs: false },
+        { path: "same-dir/old.txt", delete: true },
+        { path: "same-dir/new.txt", create: "fresh\n" },
+      ],
+    });
+    assert.equal(dryRes.isError, false);
+    assert.match(dryRes.text, /Dry run validated 5 file\(s\)/);
+    const prunedLine = dryRes.text
+      .split("\n")
+      .find((line) => line.startsWith("Would prune empty dir(s):")) ?? "";
+    assert.match(prunedLine, /deep\/nested\/leaf/);
+    assert.match(prunedLine, /deep\/nested/);
+    assert.match(prunedLine, /\bdeep\b/);
+    assert.match(prunedLine, /partial\/sub/);
+    assert.doesNotMatch(prunedLine, /keep-empty/);
+    assert.doesNotMatch(prunedLine, /same-dir/);
+    // Nothing touched on disk during dryRun
+    await fs.stat(deepFile);
+    await fs.stat(partialFile);
+
+    // Real run: verify fs.readFile is NOT called for deleted binary files (zero-copy staging)
+    const origReadFile = fs.readFile;
+    let readDeepFile = false;
+    fs.readFile = (async (...args: Parameters<typeof origReadFile>) => {
+      if (path.resolve(String(args[0])) === path.resolve(deepFile)) {
+        readDeepFile = true;
+      }
+      return origReadFile(...args);
+    }) as typeof fs.readFile;
+
+    let res;
+    try {
+      res = await runApplyEdits({
+        cwd: realSubDir,
+        pruneEmptyDirs: true,
+        edits: [
+          { path: "deep/nested/leaf/only.bin", delete: true },
+          { path: "partial/sub/last.txt", delete: true },
+          { path: "keep-empty/gone.txt", delete: true, pruneEmptyDirs: false },
+          { path: "same-dir/old.txt", delete: true },
+          { path: "same-dir/new.txt", create: "fresh\n" },
+        ],
+      });
+    } finally {
+      fs.readFile = origReadFile;
+    }
+
+    assert.equal(res.isError, false);
+    assert.equal(readDeepFile, false);
+    assert.match(res.text, /Pruned empty dir\(s\):/);
+
+    // Cascading empty dirs pruned; cwd itself preserved
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "deep")), { code: "ENOENT" });
+    await fs.stat(realSubDir);
+    // Partial empty subdir pruned; non-empty parent preserved
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "partial", "sub")), { code: "ENOENT" });
+    await fs.stat(partialKeep);
+    // Per-entry pruneEmptyDirs: false override kept empty parent dir
+    assert.deepEqual(await fs.readdir(path.join(realSubDir, "keep-empty")), []);
+    // Same-dir delete + create preserved directory and created new file
+    assert.equal(await fs.readFile(path.join(realSubDir, "same-dir", "new.txt"), "utf8"), "fresh\n");
+    await assert.rejects(() => fs.stat(sameDirOld), { code: "ENOENT" });
+    // No transaction staging dir left behind
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-fast-tx-")), false);
+  });
+
+  it("enforces cwd scope boundary, .git protection, and validation guards for delete and moveTo", async () => {
+    const outerDir = path.join(tmpDir, "scope-outer");
+    const workDir = path.join(outerDir, "workspace");
+    await fs.mkdir(path.join(workDir, ".git"), { recursive: true });
+    await fs.mkdir(path.join(workDir, "subdir"), { recursive: true });
+    const realWorkDir = await fs.realpath(workDir);
+
+    const outsideFile = path.join(outerDir, "outside.txt");
+    const gitConfig = path.join(realWorkDir, ".git", "config");
+    const insideFile = path.join(realWorkDir, "inside.txt");
+    await fs.writeFile(outsideFile, "do not touch\n", "utf8");
+    await fs.writeFile(gitConfig, "[core]\n", "utf8");
+    await fs.writeFile(insideFile, "hello\n", "utf8");
+
+    // 1. Delete outside cwd (relative .. and absolute) blocked
+    const escapeRel = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "../outside.txt", delete: true }],
+    });
+    assert.equal(escapeRel.isError, true);
+    assert.match(escapeRel.text, /strictly inside cwd/);
+    assert.equal(await fs.readFile(outsideFile, "utf8"), "do not touch\n");
+
+    const escapeAbs = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: outsideFile, delete: true }],
+    });
+    assert.equal(escapeAbs.isError, true);
+    assert.match(escapeAbs.text, /strictly inside cwd/);
+
+    // 2. Delete or move inside .git blocked
+    const gitDel = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: ".git/config", delete: true }],
+    });
+    assert.equal(gitDel.isError, true);
+    assert.match(gitDel.text, /\.git/);
+    assert.equal(await fs.readFile(gitConfig, "utf8"), "[core]\n");
+
+    const gitMove = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "inside.txt", moveTo: ".git/hijack" }],
+    });
+    assert.equal(gitMove.isError, true);
+    assert.match(gitMove.text, /\.git/);
+
+    // 3. Move destination escaping cwd blocked
+    const moveEscape = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "inside.txt", moveTo: "../escaped.txt" }],
+    });
+    assert.equal(moveEscape.isError, true);
+    assert.match(moveEscape.text, /strictly inside cwd/);
+    assert.equal(await fs.readFile(insideFile, "utf8"), "hello\n");
+
+    // 4. Direct directory delete & move blocked
+    const dirDel = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "subdir", delete: true }],
+    });
+    assert.equal(dirDel.isError, true);
+    assert.match(dirDel.text, /directory/);
+
+    const dirMove = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "subdir", moveTo: "subdir2" }],
+    });
+    assert.equal(dirMove.isError, true);
+    assert.match(dirMove.text, /directory/);
+
+    // 5. Mutually exclusive fields & same-path move rejected
+    const badCombo = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "inside.txt", delete: true, moveTo: "other.txt" }],
+    });
+    assert.equal(badCombo.isError, true);
+    assert.match(badCombo.text, /cannot combine 'delete'/);
+
+    const sameMove = await runApplyEdits({
+      cwd: realWorkDir,
+      edits: [{ path: "inside.txt", moveTo: "./inside.txt" }],
+    });
+    assert.equal(sameMove.isError, true);
+    assert.match(sameMove.text, /same path/);
+
+    // 6. Symlink boundary checks (when OS permits creating symlinks)
+    let canSymlink = true;
+    const probeLink = path.join(realWorkDir, "probe-link.txt");
+    try {
+      await fs.symlink(outsideFile, probeLink);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "EPERM") {
+        canSymlink = false;
+      } else {
+        throw err;
+      }
+    }
+    if (canSymlink) {
+      // Deleting symlink inside cwd removes only the symlink, leaving outside target untouched
+      const delLink = await runApplyEdits({
+        cwd: realWorkDir,
+        edits: [{ path: "probe-link.txt", delete: true }],
+      });
+      assert.equal(delLink.isError, false);
+      await assert.rejects(() => fs.lstat(probeLink), { code: "ENOENT" });
+      assert.equal(await fs.readFile(outsideFile, "utf8"), "do not touch\n");
+
+      // Deleting through a symlinked parent directory escaping cwd must be blocked
+      const escapeDirLink = path.join(realWorkDir, "escape-dir");
+      await fs.symlink(outerDir, escapeDirLink, "dir");
+      const escapeViaParent = await runApplyEdits({
+        cwd: realWorkDir,
+        edits: [{ path: "escape-dir/outside.txt", delete: true }],
+      });
+      assert.equal(escapeViaParent.isError, true);
+      assert.match(escapeViaParent.text, /strictly inside cwd/);
+      assert.equal(await fs.readFile(outsideFile, "utf8"), "do not touch\n");
+    }
+  });
+
+  it("supports moveTo (pure move, moveTo + hunks, overwrite, atomic swap, vacated paths, and case-only rename)", async () => {
+    const subDir = path.join(tmpDir, "move-features");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+
+    // 1. Pure move of binary file + pruneEmptyDirs
+    const binSrc = path.join(realSubDir, "old-assets", "logo.bin");
+    const binPayload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0d, 0x0a, 0x1a]);
+    await fs.mkdir(path.dirname(binSrc), { recursive: true });
+    await fs.writeFile(binSrc, binPayload);
+
+    // 2. moveTo + hunks (preserving CRLF) + pruneEmptyDirs
+    const codeSrc = path.join(realSubDir, "legacy", "helper.ts");
+    await fs.mkdir(path.dirname(codeSrc), { recursive: true });
+    await fs.writeFile(codeSrc, "import { x } from './x';\r\nexport const v = x;\r\n", "utf8");
+
+    // 3. Atomic swap a <-> b
+    await fs.writeFile(path.join(realSubDir, "a.txt"), "content-A\n", "utf8");
+    await fs.writeFile(path.join(realSubDir, "b.txt"), "content-B\n", "utf8");
+
+    // 4. Move into deleted path + create at vacated move source
+    await fs.writeFile(path.join(realSubDir, "drop-me.txt"), "old-drop\n", "utf8");
+    await fs.writeFile(path.join(realSubDir, "shift-me.txt"), "shifted-body\n", "utf8");
+
+    const res = await runApplyEdits({
+      cwd: realSubDir,
+      pruneEmptyDirs: true,
+      edits: [
+        { path: "old-assets/logo.bin", moveTo: "assets/new-logo.bin" },
+        {
+          path: "legacy/helper.ts",
+          moveTo: "src/utils/helper.ts",
+          hunks: [{ target: "./x", replacement: "../../x" }],
+        },
+        { path: "a.txt", moveTo: "b.txt" },
+        { path: "b.txt", moveTo: "a.txt" },
+        { path: "drop-me.txt", delete: true },
+        { path: "shift-me.txt", moveTo: "drop-me.txt" },
+        { path: "shift-me.txt", create: "brand-new-stub\n" },
+      ],
+    });
+    assert.equal(res.isError, false);
+    assert.match(res.text, /old-assets\/logo\.bin -> assets\/new-logo\.bin: moved/);
+    assert.match(res.text, /legacy\/helper\.ts -> src\/utils\/helper\.ts: moved & updated/);
+    assert.match(res.text, /Pruned empty dir\(s\):/);
+
+    assert.deepEqual(
+      await fs.readFile(path.join(realSubDir, "assets", "new-logo.bin")),
+      binPayload,
+    );
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "old-assets")), { code: "ENOENT" });
+
+    assert.equal(
+      await fs.readFile(path.join(realSubDir, "src", "utils", "helper.ts"), "utf8"),
+      "import { x } from '../../x';\r\nexport const v = x;\r\n",
+    );
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "legacy")), { code: "ENOENT" });
+
+    assert.equal(await fs.readFile(path.join(realSubDir, "a.txt"), "utf8"), "content-B\n");
+    assert.equal(await fs.readFile(path.join(realSubDir, "b.txt"), "utf8"), "content-A\n");
+    assert.equal(await fs.readFile(path.join(realSubDir, "drop-me.txt"), "utf8"), "shifted-body\n");
+    assert.equal(await fs.readFile(path.join(realSubDir, "shift-me.txt"), "utf8"), "brand-new-stub\n");
+
+    // 5. Overwrite guard on moveTo
+    const blockedOverwrite = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "a.txt", moveTo: "b.txt" }],
+    });
+    assert.equal(blockedOverwrite.isError, true);
+    assert.match(blockedOverwrite.text, /already exists/);
+
+    const allowedOverwrite = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "a.txt", moveTo: "b.txt", overwrite: true }],
+    });
+    assert.equal(allowedOverwrite.isError, false);
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "a.txt")), { code: "ENOENT" });
+    assert.equal(await fs.readFile(path.join(realSubDir, "b.txt"), "utf8"), "content-B\n");
+
+    // 6. Case-only rename on case-insensitive filesystems (Windows / macOS)
+    if (process.platform === "win32" || process.platform === "darwin") {
+      await fs.writeFile(path.join(realSubDir, "camelFile.txt"), "case-test\n", "utf8");
+      const caseRes = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [{ path: "camelFile.txt", moveTo: "CamelFile.txt" }],
+      });
+      assert.equal(caseRes.isError, false);
+      const entries = await fs.readdir(realSubDir);
+      assert.equal(entries.includes("CamelFile.txt"), true);
+      assert.equal(await fs.readFile(path.join(realSubDir, "CamelFile.txt"), "utf8"), "case-test\n");
+    }
+  });
+
+  it("rolls back deleted files, moved files, overwritten targets, and pruned empty dirs on Phase 2 failure", async () => {
+    const subDir = path.join(tmpDir, "delete-move-rollback");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+
+    // Scenario A: Failure during Stage 2b write rolls back Stage 1 deletes, moves, and overwrites
+    const delFile = path.join(realSubDir, "del-dir", "big.bin");
+    const mvSrc = path.join(realSubDir, "mv-dir", "src.bin");
+    const mvDest = path.join(realSubDir, "existing.bin");
+    const failTarget = path.join(realSubDir, "fail.txt");
+    await fs.mkdir(path.dirname(delFile), { recursive: true });
+    await fs.mkdir(path.dirname(mvSrc), { recursive: true });
+
+    const delBytes = Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
+    const mvSrcBytes = Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0x00, 0x02]);
+    const mvDestBytes = Buffer.from([0x11, 0x22, 0x33, 0x44, 0x00, 0x03]);
+    await fs.writeFile(delFile, delBytes);
+    await fs.writeFile(mvSrc, mvSrcBytes);
+    await fs.writeFile(mvDest, mvDestBytes);
+    await fs.writeFile(failTarget, "original fail\n", "utf8");
+
+    const origWriteFile = fs.writeFile;
+    fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
+      if (String(args[0]).startsWith(`${failTarget}.agy-fast-tmp-`)) {
+        throw makeErrnoError("ENOSPC", "ENOSPC: disk full");
+      }
+      return origWriteFile(...args);
+    }) as typeof fs.writeFile;
+
+    try {
+      const resA = await runApplyEdits({
+        cwd: realSubDir,
+        pruneEmptyDirs: true,
+        edits: [
+          { path: "del-dir/big.bin", delete: true },
+          { path: "mv-dir/src.bin", moveTo: "existing.bin", overwrite: true },
+          { path: "fail.txt", hunks: [{ target: "original fail", replacement: "updated fail" }] },
+        ],
+      });
+      assert.equal(resA.isError, true);
+      assert.match(resA.text, /Write failed \(changes rolled back\)/);
+      assert.match(resA.text, /ENOSPC/);
+    } finally {
+      fs.writeFile = origWriteFile;
+    }
+
+    assert.deepEqual(await fs.readFile(delFile), delBytes);
+    assert.deepEqual(await fs.readFile(mvSrc), mvSrcBytes);
+    assert.deepEqual(await fs.readFile(mvDest), mvDestBytes);
+    assert.equal(await fs.readFile(failTarget, "utf8"), "original fail\n");
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-fast-tx-")), false);
+
+    // Scenario B: Stage 3 rmdir failure rolls back already-pruned subdir and restores deleted file
+    const p1p2 = path.join(realSubDir, "p1", "p2");
+    const p3Leaf = path.join(p1p2, "p3", "leaf.txt");
+    await fs.mkdir(path.dirname(p3Leaf), { recursive: true });
+    await fs.writeFile(p3Leaf, "survive rollback\n", "utf8");
+
+    const origRmdir = fs.rmdir;
+    fs.rmdir = (async (...args: Parameters<typeof origRmdir>) => {
+      if (path.resolve(String(args[0])) === path.resolve(p1p2)) {
+        throw makeErrnoError("EACCES", "EACCES: permission denied");
+      }
+      return origRmdir(...args);
+    }) as typeof fs.rmdir;
+
+    try {
+      const resB = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [{ path: "p1/p2/p3/leaf.txt", delete: true, pruneEmptyDirs: true }],
+      });
+      assert.equal(resB.isError, true);
+      assert.match(resB.text, /Write failed \(changes rolled back\)/);
+      assert.match(resB.text, /EACCES/);
+    } finally {
+      fs.rmdir = origRmdir;
+    }
+
+    assert.equal(await fs.readFile(p3Leaf, "utf8"), "survive rollback\n");
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-fast-tx-")), false);
+
+    // Scenario C: bestEffort applies valid delete/move and reports failed entries without touching invalid targets
+    const beRes = await runApplyEdits({
+      cwd: realSubDir,
+      bestEffort: true,
+      edits: [
+        { path: "p1/p2/p3/leaf.txt", delete: true, pruneEmptyDirs: true },
+        { path: "does-not-exist.txt", delete: true },
+        { path: "fail.txt", moveTo: "existing.bin" }, // blocked by overwrite: false
+      ],
+    });
+    assert.equal(beRes.isError, true);
+    assert.match(beRes.text, /Partial edit applied \(1\/3/);
+    assert.match(beRes.text, /Pruned empty dir\(s\):/);
+    await assert.rejects(() => fs.stat(path.join(realSubDir, "p1")), { code: "ENOENT" });
+    assert.equal(await fs.readFile(failTarget, "utf8"), "original fail\n");
+  });
 });

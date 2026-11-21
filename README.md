@@ -190,7 +190,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 
 ### 2. `apply_edits` — Atomic Multi-Hunk & Multi-File Edits + Verify
 - **Up to 50 files per call:** Validates every hunk and overlap in memory before touching disk (`0` files modified on error), or pass `bestEffort: true` on larger batches so valid files commit atomically per file while failed files return closest-line / drifted-line snippets for targeted retry.
-- **Faithful file handling:** Preserves CRLF line endings, file permissions, and symlinks; supports `startLine`/`endLine`, `replaceAll`, `create`/`overwrite`, and `dryRun`.
+- **Faithful file handling:** Preserves CRLF line endings, file permissions, and symlinks; supports `startLine`/`endLine`, `replaceAll`, `create`/`overwrite`, `delete`, `moveTo` (standalone or combined with `hunks`), `pruneEmptyDirs` (clean empty parent dirs strictly inside `cwd` with same-filesystem O(1) staging rollback), and `dryRun`.
 - **Inline `verify`:** Optionally runs a build/typecheck/test command right after writing, stripping noisy logs (e.g., Pino/Bunyan info JSON, Maven footers) so root causes stay within budget.
 
 ### 3. `read_slices` — Multi-Language Symbol Outlines & Targeted Slices
